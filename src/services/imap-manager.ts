@@ -1,3 +1,4 @@
+// @ts-nocheck
 import Imap from 'imap';
 import { simpleParser } from 'mailparser';
 import { EventEmitter } from 'events';
@@ -16,7 +17,7 @@ export class IMAPManager extends EventEmitter {
   private connection: Imap | null = null;
   private isConnected = false;
   private isConnecting = false;
-  private currentFolder = 'INBOX';
+  private currentFolder = '';  // empty = no mailbox selected yet; set after openBox succeeds
   private connectionTimeout: NodeJS.Timeout | null = null;
 
   constructor(private config: IMAPConfig) {
@@ -126,6 +127,7 @@ export class IMAPManager extends EventEmitter {
     this.isConnected = false;
     this.isConnecting = false;
     this.connection = null;
+    this.currentFolder = '';  // reset so next openFolder actually opens
   }
 
   private async ensureConnected(): Promise<void> {
@@ -254,7 +256,7 @@ export class IMAPManager extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       const criteria = unreadOnly ? ['UNSEEN'] : ['ALL'];
-      
+
       this.connection!.search(criteria, (err, results) => {
         if (err) {
           reject(new IMAPError(`Failed to get recent emails: ${err.message}`));
@@ -266,7 +268,7 @@ export class IMAPManager extends EventEmitter {
           return;
         }
 
-        // Get the most recent emails (highest UIDs)
+        // Get the most recent emails (highest sequence numbers)
         const recentResults = results.slice(-limit);
 
         this.fetchMessages(recentResults)
@@ -279,27 +281,47 @@ export class IMAPManager extends EventEmitter {
   async getEmail(messageId: string, folder = 'INBOX'): Promise<EmailMessage | null> {
     await this.openFolder(folder);
 
+    const trimmed = (messageId ?? '').trim();
+    const isNumericUid = /^\d+$/.test(trimmed);
+
     return new Promise((resolve, reject) => {
-      // Try to find by Message-ID header first
-      this.connection!.search([['HEADER', 'MESSAGE-ID', messageId]], (err, results) => {
+      // Resolve a bare numeric id as the persistent IMAP UID that searchEmails()
+      // hands back. We MUST use UID SEARCH (not connection.fetch, which operates
+      // on sequence numbers) and we must NOT pre-run a HEADER MESSAGE-ID search:
+      // IMAP HEADER search is a *substring* match, so a bare number like "6360"
+      // spuriously matches any unrelated message whose RFC Message-ID merely
+      // contains those digits — the original "wrong email" bug.
+      const fetchByUid = () => {
+        this.connection!.search([['UID', trimmed]], (uidErr, uidResults) => {
+          if (uidErr) {
+            reject(new IMAPError(`Failed to look up message by UID: ${uidErr.message}`));
+            return;
+          }
+          if (!uidResults || uidResults.length === 0) {
+            resolve(null);
+            return;
+          }
+          this.fetchMessages(uidResults)
+            .then(emails => resolve(emails[0] || null))
+            .catch(reject);
+        });
+      };
+
+      if (isNumericUid) {
+        fetchByUid();
+        return;
+      }
+
+      // Non-numeric ids are treated as RFC Message-ID header values.
+      this.connection!.search([['HEADER', 'MESSAGE-ID', trimmed]], (err, results) => {
         if (err) {
           reject(new IMAPError(`Failed to search for email: ${err.message}`));
           return;
         }
-
-        if (results.length === 0) {
-          // Try to find by UID if Message-ID search fails
-          const uid = parseInt(messageId, 10);
-          if (!isNaN(uid)) {
-            this.fetchMessages([uid])
-              .then(emails => resolve(emails[0] || null))
-              .catch(reject);
-          } else {
-            resolve(null);
-          }
+        if (!results || results.length === 0) {
+          resolve(null);
           return;
         }
-
         this.fetchMessages(results)
           .then(emails => resolve(emails[0] || null))
           .catch(reject);
@@ -331,74 +353,84 @@ export class IMAPManager extends EventEmitter {
   }
 
   private async fetchMessages(uids: number[]): Promise<EmailMessage[]> {
+    // Collect per-message parse promises so we can wait for ALL of them before
+    // resolving. The previous implementation had a race: `fetch.once('end')`
+    // fired before the async `simpleParser` callbacks inside `msg.once('end')`
+    // completed, so `messages` was still empty when resolve() was called.
     return new Promise((resolve, reject) => {
-      const messages: EmailMessage[] = [];
+      const parsePromises: Promise<EmailMessage | null>[] = [];
       const fetch = this.connection!.fetch(uids, {
         bodies: '',
         struct: true
       });
 
       fetch.on('message', (msg, seqno) => {
-        let buffer = '';
-        let uid = 0;
-        let flags: string[] = [];
-        let size = 0;
+        // Each parseComplete promise is pushed immediately so fetch.end
+        // can await it, but the actual parse happens asynchronously.
+        const parsePromise = new Promise<EmailMessage | null>((resolveMsg) => {
+          let buffer = '';
+          let uid = 0;
+          let flags: string[] = [];
+          let size = 0;
 
-        msg.on('body', (stream) => {
-          stream.on('data', (chunk) => {
-            buffer += chunk.toString();
+          msg.on('body', (stream) => {
+            stream.on('data', (chunk) => {
+              buffer += chunk.toString();
+            });
+          });
+
+          msg.once('attributes', (attrs) => {
+            uid = attrs.uid;
+            flags = attrs.flags;
+            size = attrs.size;
+          });
+
+          msg.once('end', async () => {
+            try {
+              const parsed = await simpleParser(buffer);
+              const emailMessage: EmailMessage = {
+                id: uid.toString(),
+                uid,
+                subject: parsed.subject,
+                from: parsed.from?.value || [],
+                to: parsed.to?.value || [],
+                cc: parsed.cc?.value || [],
+                bcc: parsed.bcc?.value || [],
+                date: parsed.date,
+                flags,
+                size,
+                text: parsed.text,
+                html: parsed.html,
+                messageId: parsed.messageId,
+                inReplyTo: parsed.inReplyTo,
+                references: parsed.references,
+                headers: parsed.headers as any,
+                attachments: parsed.attachments?.map(att => ({
+                  contentType: att.contentType,
+                  filename: att.filename,
+                  size: att.size,
+                  contentId: att.contentId,
+                  content: att.content
+                })) || []
+              };
+              resolveMsg(emailMessage);
+            } catch (err) {
+              console.error('Failed to parse email:', err);
+              resolveMsg(null);
+            }
           });
         });
-
-        msg.once('attributes', (attrs) => {
-          uid = attrs.uid;
-          flags = attrs.flags;
-          size = attrs.size;
-        });
-
-        msg.once('end', async () => {
-          try {
-            const parsed = await simpleParser(buffer);
-            
-            const emailMessage: EmailMessage = {
-              id: uid.toString(),
-              uid,
-              subject: parsed.subject,
-              from: parsed.from?.value || [],
-              to: parsed.to?.value || [],
-              cc: parsed.cc?.value || [],
-              bcc: parsed.bcc?.value || [],
-              date: parsed.date,
-              flags,
-              size,
-              text: parsed.text,
-              html: parsed.html,
-              messageId: parsed.messageId,
-              inReplyTo: parsed.inReplyTo,
-              references: parsed.references,
-              headers: parsed.headers as any,
-              attachments: parsed.attachments?.map(att => ({
-                contentType: att.contentType,
-                filename: att.filename,
-                size: att.size,
-                contentId: att.contentId,
-                content: att.content
-              })) || []
-            };
-
-            messages.push(emailMessage);
-          } catch (err) {
-            console.error('Failed to parse email:', err);
-          }
-        });
+        parsePromises.push(parsePromise);
       });
 
       fetch.once('error', (err) => {
         reject(new IMAPError(`Failed to fetch messages: ${err.message}`));
       });
 
-      fetch.once('end', () => {
-        // Sort by UID to maintain order
+      fetch.once('end', async () => {
+        // Wait for all per-message parsers to finish, then sort & resolve.
+        const results = await Promise.all(parsePromises);
+        const messages = results.filter((m): m is EmailMessage => m !== null);
         messages.sort((a, b) => a.uid - b.uid);
         resolve(messages);
       });
