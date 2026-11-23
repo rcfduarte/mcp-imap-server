@@ -87,3 +87,13 @@ jspm_packages/
 
 # TernJS port file
 .tern-port
+# Added 2026-04-16 — missing critical patterns
+.mcp.json
+.claude/secrets/
+__pycache__/
+.venv/
+.ruff_cache/
+credentials.json
+*.key
+*.pem
+secrets/
